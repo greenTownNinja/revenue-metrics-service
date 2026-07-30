@@ -1,0 +1,12 @@
+// Production build: src/ only, so dist/ contains exactly what runs on Render —
+// no tests, no scripts, and therefore no devDependency imports (PGlite) in the
+// deployed tree. Emits dist/server.js.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "tests", "scripts"]
+}

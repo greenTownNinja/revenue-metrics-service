@@ -1,0 +1,28 @@
+# Render Blueprint. Free tier.
+#
+# Note the free-tier characteristics this service is built around:
+#   - the instance spins down when idle, so the first request after a pause takes
+#     ~50s while Node boots (hit /health first)
+#   - DATABASE_URL must be the Supabase connection POOLER string; Render's free
+#     egress cannot reliably reach db.<ref>.supabase.co over IPv6
+services:
+  - type: web
+    name: revenue-metrics-service
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: info
+      - key: PG_POOL_MAX
+        value: "3"
+      # Set these in the Render dashboard; never commit them.
+      - key: DATABASE_URL
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false

@@ -1,0 +1,42 @@
+{
+  "name": "revenue-metrics-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "One canonical revenue metric across multiple payment sources, exposed through two views that cannot disagree.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/copyAssets.mjs",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "demo": "tsx scripts/demo.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "seed:stripe": "tsx scripts/seedStripe.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "pino-http": "^10.3.0",
+    "stripe": "^17.5.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.2.15",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.10"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true
+  }
+}

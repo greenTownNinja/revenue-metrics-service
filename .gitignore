@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output (Render runs `npm run build` itself)
+dist/
+
+# Secrets. .env.example is committed as a template and must never hold a real value.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# Test / tool output
+coverage/
+.vitest/
+*.tsbuildinfo
+
+# Local agent + editor state
+.claude/
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
