@@ -11,6 +11,10 @@ dist/
 *.pem
 *.key
 
+# Generated ledger data. The generator script is committed; its output is not —
+# it is large, reproducible from a seed, and not a source of truth.
+data/
+
 # Logs
 *.log
 npm-debug.log*

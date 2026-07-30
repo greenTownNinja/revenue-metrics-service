@@ -51,15 +51,40 @@ export function getPool(): pg.Pool {
   return pool;
 }
 
+/**
+ * Runs one query against a pg client or pool.
+ *
+ * Two node-postgres behaviours have to be handled here, both of which only show
+ * up against a real server:
+ *
+ *  - Passing a values array (even an empty one) selects the extended query
+ *    protocol, which rejects multiple statements in one command. The migration
+ *    files are multi-statement batches, so parameterless SQL must be sent with no
+ *    values argument at all, using the simple protocol.
+ *  - A simple-protocol batch returns an ARRAY of results, one per statement, so
+ *    `res.rows` is undefined. Take the last result, which is what callers want.
+ */
+async function runQuery<T>(
+  client: Pick<pg.Pool, 'query'> | pg.PoolClient,
+  sql: string,
+  params: readonly unknown[],
+): Promise<QueryResult<T>> {
+  try {
+    const res = params.length
+      ? await client.query(sql, params as unknown[])
+      : await client.query(sql);
+
+    const last = Array.isArray(res) ? res[res.length - 1] : res;
+    const rows = (last?.rows ?? []) as T[];
+    return { rows, rowCount: last?.rowCount ?? rows.length };
+  } catch (cause) {
+    throw new DatabaseError(firstLine(sql), cause);
+  }
+}
+
 export function createExecutor(p: pg.Pool = getPool()): TransactionalExecutor {
-  const exec = async <T>(sql: string, params: readonly unknown[] = []): Promise<QueryResult<T>> => {
-    try {
-      const res = await p.query(sql, params as unknown[]);
-      return { rows: res.rows as T[], rowCount: res.rowCount ?? res.rows.length };
-    } catch (cause) {
-      throw new DatabaseError(firstLine(sql), cause);
-    }
-  };
+  const exec = <T>(sql: string, params: readonly unknown[] = []): Promise<QueryResult<T>> =>
+    runQuery<T>(p, sql, params);
 
   return {
     query: exec,
@@ -70,14 +95,8 @@ export function createExecutor(p: pg.Pool = getPool()): TransactionalExecutor {
       try {
         await client.query('BEGIN');
         const tx: Executor = {
-          async query<R>(sql: string, params: readonly unknown[] = []) {
-            try {
-              const res = await client.query(sql, params as unknown[]);
-              return { rows: res.rows as R[], rowCount: res.rowCount ?? res.rows.length };
-            } catch (cause) {
-              throw new DatabaseError(firstLine(sql), cause);
-            }
-          },
+          query: <R>(sql: string, params: readonly unknown[] = []) =>
+            runQuery<R>(client, sql, params),
         };
         const result = await fn(tx);
         await client.query('COMMIT');

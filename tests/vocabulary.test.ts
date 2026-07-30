@@ -10,7 +10,11 @@ import { describe, expect, it } from 'vitest';
 import { CanonicalStatus, COLLECTED_STATUSES, isCollected } from '../src/revenue/canonical.js';
 import { STRIPE_VOCABULARY, normalizeCharge } from '../src/sources/stripe/StripeAdapter.js';
 import { LEDGER_VOCABULARY } from '../src/sources/ledgerCsv/LedgerCsvAdapter.js';
+import { PAYPAL_VOCABULARY } from '../src/sources/paypal/PayPalAdapter.js';
 import type Stripe from 'stripe';
+
+/** Every registered vocabulary. Add a source here and the invariants below cover it. */
+const ALL_VOCABULARIES = [STRIPE_VOCABULARY, LEDGER_VOCABULARY, PAYPAL_VOCABULARY];
 
 describe('provider vocabularies', () => {
   it('pins the Stripe charge vocabulary', () => {
@@ -35,23 +39,36 @@ describe('provider vocabularies', () => {
     });
   });
 
-  it('uses genuinely different spellings for "collected" across sources', () => {
-    // If both sources happened to agree, this suite would not be testing
-    // normalization at all.
+  it('uses genuinely different spellings for "collected" across all sources', () => {
+    // 'succeeded' vs 'paid'/'completed' vs 'S'. If any two sources happened to
+    // agree, this suite would not be testing normalization at all.
     const collectedIn = (v: Record<string, CanonicalStatus>) =>
       new Set(Object.entries(v).filter(([, s]) => isCollected(s)).map(([k]) => k));
 
-    const stripe = collectedIn({ ...STRIPE_VOCABULARY });
-    const ledger = collectedIn({ ...LEDGER_VOCABULARY });
+    const vocabs = [
+      ['stripe', collectedIn({ ...STRIPE_VOCABULARY })],
+      ['ledger', collectedIn({ ...LEDGER_VOCABULARY })],
+      ['paypal', collectedIn({ ...PAYPAL_VOCABULARY })],
+    ] as const;
 
-    expect(stripe.size).toBeGreaterThan(0);
-    expect(ledger.size).toBeGreaterThan(0);
-    expect([...stripe].some((s) => ledger.has(s))).toBe(false);
+    for (const [name, set] of vocabs) {
+      expect(set.size, `${name} has no collected status`).toBeGreaterThan(0);
+    }
+
+    // Pairwise disjoint: no spelling of "collected" is shared by two providers.
+    for (let i = 0; i < vocabs.length; i += 1) {
+      for (let j = i + 1; j < vocabs.length; j += 1) {
+        const [nameA, a] = vocabs[i]!;
+        const [nameB, b] = vocabs[j]!;
+        const shared = [...a].filter((s) => b.has(s));
+        expect(shared, `${nameA} and ${nameB} share ${shared.join(', ')}`).toEqual([]);
+      }
+    }
   });
 
   it('never maps a status to a canonical value outside the enum', () => {
     const valid = new Set<string>(Object.values(CanonicalStatus));
-    for (const vocab of [STRIPE_VOCABULARY, LEDGER_VOCABULARY]) {
+    for (const vocab of ALL_VOCABULARIES) {
       for (const status of Object.values(vocab)) {
         expect(valid.has(status)).toBe(true);
       }
@@ -59,7 +76,7 @@ describe('provider vocabularies', () => {
   });
 
   it('keeps UNKNOWN out of every vocabulary, so it can only arise from a miss', () => {
-    for (const vocab of [STRIPE_VOCABULARY, LEDGER_VOCABULARY]) {
+    for (const vocab of ALL_VOCABULARIES) {
       expect(Object.values(vocab)).not.toContain(CanonicalStatus.UNKNOWN);
     }
     expect(COLLECTED_STATUSES).not.toContain(CanonicalStatus.UNKNOWN);

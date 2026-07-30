@@ -65,21 +65,39 @@ export class StripeAdapter implements SourceAdapter {
     );
   }
 
+  /**
+   * Fetches charges created since the watermark.
+   *
+   * The watermark is a `created` TIMESTAMP, not a charge id. Stripe lists
+   * newest-first and `starting_after` pages toward OLDER records, so an id-based
+   * cursor walks backwards through history and never sees anything new. Filtering
+   * on `created[gte]` and paging newest→oldest within the run is what actually
+   * picks up new charges.
+   *
+   * OVERLAP_SECONDS of deliberate re-fetch covers charges that were created just
+   * before the previous run's boundary but committed just after it. Re-fetching is
+   * free because the upsert is idempotent; missing a charge is not.
+   */
   async fetch(options: FetchOptions): Promise<FetchResult> {
     const normalized: NormalizedTransaction[] = [];
     const quarantined: QuarantinedRecord[] = [];
     let fetched = 0;
-    let startingAfter = options.cursor ?? undefined;
-    let lastId: string | null = options.cursor;
     let pages = 0;
+    let startingAfter: string | undefined;
 
-    // Stripe's list endpoints return 10 records without explicit pagination —
-    // walking has_more/starting_after is not optional.
+    const since = parseWatermark(options.cursor);
+    const createdFilter = since === null ? undefined : { gte: since - OVERLAP_SECONDS };
+
+    // Highest `created` seen this run becomes the next watermark. Seeded with the
+    // previous one so an empty run does not rewind the watermark to zero.
+    let maxCreated = since ?? 0;
+
     while (pages < options.maxPages) {
       let page: Stripe.ApiList<Stripe.Charge>;
       try {
         page = await this.stripe.charges.list({
           limit: PAGE_SIZE,
+          ...(createdFilter ? { created: createdFilter } : {}),
           ...(startingAfter ? { starting_after: startingAfter } : {}),
         });
       } catch (err) {
@@ -90,28 +108,46 @@ export class StripeAdapter implements SourceAdapter {
       fetched += page.data.length;
 
       for (const charge of page.data) {
+        if (Number.isFinite(charge.created) && charge.created > maxCreated) {
+          maxCreated = charge.created;
+        }
         const result = normalizeCharge(charge);
         if ('reason' in result) {
           quarantined.push(result);
         } else {
           normalized.push(result);
         }
-        lastId = charge.id;
       }
 
       if (!page.has_more || page.data.length === 0) {
-        // Caught up. Keep the last id as the resume point for the next sync.
-        return { normalized, quarantined, nextCursor: lastId, fetched };
+        return { normalized, quarantined, nextCursor: serializeWatermark(maxCreated), fetched };
       }
       startingAfter = page.data[page.data.length - 1]!.id;
     }
 
+    // Page cap hit mid-backfill. Advancing the watermark now would skip the older
+    // charges we have not reached yet, so leave it where it was and let the next
+    // run continue from the same point.
     logger.info(
       { source: STRIPE_SOURCE, pages, maxPages: options.maxPages },
-      'page cap reached; more data remains and will be picked up next sync',
+      'page cap reached; watermark held so the remaining history is not skipped',
     );
-    return { normalized, quarantined, nextCursor: lastId, fetched };
+    return { normalized, quarantined, nextCursor: options.cursor, fetched };
   }
+}
+
+/** Seconds of deliberate overlap between runs. See fetch(). */
+const OVERLAP_SECONDS = 3600;
+
+/** Watermark is a unix-seconds string. Anything unparseable means "full sync". */
+function parseWatermark(cursor: string | null): number | null {
+  if (cursor === null || cursor === '') return null;
+  const parsed = Number(cursor);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+}
+
+function serializeWatermark(created: number): string | null {
+  return created > 0 ? String(created) : null;
 }
 
 /**

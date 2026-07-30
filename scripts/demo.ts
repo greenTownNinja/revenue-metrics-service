@@ -8,6 +8,8 @@
  * demo-video walkthrough: sync, both views agreeing, and the edge cases.
  */
 
+import 'dotenv/config';
+
 import { createApp } from '../src/app.js';
 import { createTestDb } from '../tests/helpers/testDb.js';
 import { SyncService } from '../src/sync/SyncService.js';

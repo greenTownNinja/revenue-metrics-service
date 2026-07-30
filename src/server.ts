@@ -2,14 +2,34 @@
  * Process bootstrap: build dependencies, run migrations, listen.
  */
 
+// MUST be the first import: logger.ts reads LOG_LEVEL at module load, so .env has
+// to be in process.env before anything else is evaluated. dotenv does not
+// override variables that are already set, so Render's dashboard values still win
+// in production (where there is no .env file at all).
+import 'dotenv/config';
+
 import { createApp } from './app.js';
 import { createExecutor, closePool, getPool } from './db/pool.js';
 import { runMigrations } from './db/migrate.js';
 import { SyncService } from './sync/SyncService.js';
 import { StripeAdapter } from './sources/stripe/StripeAdapter.js';
+import { PayPalAdapter } from './sources/paypal/PayPalAdapter.js';
 import { LedgerCsvAdapter } from './sources/ledgerCsv/LedgerCsvAdapter.js';
 import type { SourceAdapter } from './sources/SourceAdapter.js';
 import { logger } from './logger.js';
+
+/** Registers an adapter if its credentials are present; logs why if not. */
+function register(into: SourceAdapter[], name: string, build: () => SourceAdapter): void {
+  try {
+    into.push(build());
+    logger.info({ source: name }, 'source registered');
+  } catch (err) {
+    logger.warn(
+      { source: name, reason: err instanceof Error ? err.message : String(err) },
+      `source NOT registered; /sync?source=${name} will 400`,
+    );
+  }
+}
 
 async function main(): Promise<void> {
   const db = createExecutor(getPool());
@@ -18,17 +38,29 @@ async function main(): Promise<void> {
   // boot keeps a Render free-tier deploy to a single step.
   await runMigrations(db);
 
-  const adapters: SourceAdapter[] = [new LedgerCsvAdapter()];
+  const adapters: SourceAdapter[] = [];
 
-  // Stripe is optional at boot: a missing key must not stop the service from
-  // serving revenue for sources that are already synced.
-  try {
-    adapters.push(StripeAdapter.fromEnv());
-    logger.info('stripe adapter registered');
-  } catch (err) {
+  // Every source is optional at boot. Missing credentials for one provider must
+  // not stop the service from serving revenue for the others, or for data that is
+  // already synced — a metrics API that refuses to answer because an upstream is
+  // misconfigured is worse than one that answers from what it has.
+  register(adapters, 'stripe', () => StripeAdapter.fromEnv());
+  register(adapters, 'paypal', () => PayPalAdapter.fromEnv());
+
+  // The CSV ledger is a fixture, not a real source. It stays available for the
+  // credential-free demo and the test suite, but is off unless asked for.
+  if (process.env.ENABLE_CSV_SOURCE === 'true') {
+    adapters.push(LedgerCsvAdapter.fromEnv());
+    logger.info(
+      { source: 'ledger-csv', path: process.env.LEDGER_CSV_PATH ?? '(bundled fixture)' },
+      'fixture source registered (ENABLE_CSV_SOURCE=true)',
+    );
+  }
+
+  if (adapters.length === 0) {
     logger.warn(
-      { reason: err instanceof Error ? err.message : String(err) },
-      'stripe adapter NOT registered; /sync?source=stripe will 400',
+      'no sources registered — /sync will 400 for every source. Set STRIPE_SECRET_KEY ' +
+        'and/or PAYPAL_CLIENT_ID + PAYPAL_CLIENT_SECRET.',
     );
   }
 

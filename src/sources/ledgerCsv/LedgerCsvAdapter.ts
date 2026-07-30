@@ -77,6 +77,18 @@ export class LedgerCsvAdapter implements SourceAdapter {
   constructor(private readonly fixturePath: string = DEFAULT_FIXTURE) {}
 
   /**
+   * Reads LEDGER_CSV_PATH if set, otherwise the committed fixture.
+   *
+   * Deliberately a factory rather than a default-parameter env read: the tests
+   * construct `new LedgerCsvAdapter()` and assert exact row counts against the
+   * committed fixture, and an env var must never be able to change what they see.
+   */
+  static fromEnv(): LedgerCsvAdapter {
+    const path = process.env.LEDGER_CSV_PATH;
+    return new LedgerCsvAdapter(path && path.trim() !== '' ? path.trim() : DEFAULT_FIXTURE);
+  }
+
+  /**
    * A file-backed source has nothing to paginate, so the cursor is unused and
    * `nextCursor` stays null. Sync is still idempotent via the upsert.
    */

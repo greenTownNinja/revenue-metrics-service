@@ -3,6 +3,10 @@
  * records what ran, so re-running is a no-op.
  */
 
+// First import, so `npm run migrate` picks up DATABASE_URL from .env. Harmless
+// when this module is imported by server.ts, which loads dotenv itself.
+import 'dotenv/config';
+
 import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';

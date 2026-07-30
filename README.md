@@ -2,7 +2,9 @@
 
 One canonical "total revenue collected" across multiple payment sources, exposed through two views that cannot disagree.
 
-Transactions arrive from source systems with different status vocabularies — Stripe says `succeeded`, an invoice ledger says `paid` or `completed`. Both normalize onto one closed canonical enum, and revenue is computed from an **allow-list** of statuses that count, in exactly one place in the codebase. A summary endpoint and a day-by-day endpoint read that same code path, and a CI guard fails the build if a second, divergent calculation is ever introduced.
+Transactions arrive from source systems with different status vocabularies — Stripe says `succeeded`, PayPal says `S`, an invoice ledger says `paid` or `completed`. All of them normalize onto one closed canonical enum, and revenue is computed from an **allow-list** of statuses that count, in exactly one place in the codebase. A summary endpoint and a day-by-day endpoint read that same code path, and a CI guard fails the build if a second, divergent calculation is ever introduced.
+
+**Live sources:** Stripe test mode and PayPal sandbox, both over their real APIs.
 
 **Live deployment:** _(fill in your Render URL)_ — e.g. `https://revenue-metrics-service.onrender.com`
 
@@ -71,11 +73,11 @@ Stripe leaves a fully refunded charge's `status` as `succeeded`. Taking that at 
 ## Architecture
 
 ```
-Stripe API (test mode) ─┐
-                        ├─→ SourceAdapter ─→ NormalizedTransaction ─→ upsert ─→ transactions
-ledger.csv ─────────────┘         │                                                  │
-                                  │ unmappable                                       │
-                                  └──────────→ quarantined_transactions              │
+Stripe API   'succeeded' ─┐
+PayPal API   'S'          ├─→ SourceAdapter ─→ NormalizedTransaction ─→ upsert ─→ transactions
+ledger.csv   'paid'       ┘         │                                                │
+             (fixture)              │ unmappable                                     │
+                                    └────────→ quarantined_transactions              │
                                                                                      ▼
                                                                         RevenueRepository
                                                                   ← the ONLY SQL that sums money
@@ -96,8 +98,11 @@ src/
 │   └── RevenueService.ts          the only entry point for the number
 ├── sources/                     ← vocabulary mapping only; never aggregation
 │   ├── SourceAdapter.ts
+│   ├── decimal.ts                 exact decimal-string → minor units (no float)
 │   ├── stripe/StripeAdapter.ts
-│   └── ledgerCsv/LedgerCsvAdapter.ts
+│   ├── paypal/PayPalClient.ts     OAuth2 + Transaction Search
+│   ├── paypal/PayPalAdapter.ts
+│   └── ledgerCsv/LedgerCsvAdapter.ts   fixture; opt-in via ENABLE_CSV_SOURCE
 ├── sync/                          fetch → normalize → upsert → watermark
 ├── api/                           thin controllers: validate, call, serialize
 ├── db/                            pool, migrations, migration runner
@@ -224,24 +229,56 @@ npm run demo    # real app + PGlite + CSV source
 npm test
 ```
 
-### Against Supabase and Stripe
+### Against Supabase, Stripe and PayPal
 
 ```bash
 cp .env.example .env
-# fill in DATABASE_URL and STRIPE_SECRET_KEY
+# fill in DATABASE_URL, STRIPE_SECRET_KEY, PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET
 npm run migrate
-npm run seed:stripe          # optional: creates test-mode charges
+npm run seed:stripe          # creates test-mode charges in several states
 npm run dev
 ```
 
+**PayPal setup:** at [developer.paypal.com](https://developer.paypal.com) → Apps & Credentials → Sandbox → create a REST app, then **enable the "Transaction Search" feature on it** and regenerate credentials. Without that feature the reporting endpoint returns 403, which the adapter reports as `UPSTREAM_CONFIG_ERROR` with that exact instruction rather than as a generic outage.
+
+Sandbox transactions also take time to appear in Transaction Search — often several hours, occasionally longer. An empty first sync is usually latency, not a bug. Check what the account actually has before assuming the adapter is wrong.
+
+### Getting data spread across dates
+
+Neither Stripe nor PayPal lets you backdate a transaction — `created` is server-side — so a freshly seeded sandbox produces everything on one day, and a day-by-day endpoint has nothing to break down. Three options, in order of reliability:
+
+**1. Generate a ledger** (no credentials, instant, fully controllable):
+
 ```bash
-curl -X POST "http://localhost:3000/sync"
+npm run generate:ledger -- --rows 800 --from 2026-02-01 --to 2026-07-29
+# then in .env:  ENABLE_CSV_SOURCE=true  and  LEDGER_CSV_PATH=<printed path>
+```
+
+Deterministic from a seed, weekday-weighted so the daily curve has shape, four currencies, a mix of mappable and unmappable statuses, a handful of rows that must be quarantined, and one amount past `Number.MAX_SAFE_INTEGER`. 800 rows over 179 days lands ~154 populated days.
+
+**2. Stripe Test Clocks** — real backdated Stripe charges:
+
+```bash
+npm run seed:stripe:clock -- --weeks 17
+npm run seed:stripe:clock -- --cleanup     # deletes clocks and everything on them
+```
+
+Creates a clock in the past, puts 3 customers × 3 weekly subscriptions on it, and advances two billing cycles at a time; objects generated during advancement are stamped with the simulated time. One customer uses a failing card, so the `failed` charges are real rather than synthetic. Takes a few minutes.
+
+The design is dictated by Stripe's [documented limits](https://docs.stripe.com/billing/testing/test-clocks/api-advanced-usage): max 2 billing cycles per advance, 20 invoices per subscription per day (which rules out daily billing over a long range), and 3 customers × 3 subscriptions per clock. Clocks auto-delete after 30 days.
+
+Stripe's docs also warn that list endpoints may hide test-clock objects without an explicit filter, which would make these charges invisible to the sync adapter. The script therefore **verifies** at the end by calling the same `charges.list` the adapter uses, and tells you to fall back to option 1 if the charges don't show up.
+
+**3. `npm run seed:stripe -- 250`** — high volume, but all on today. Fine for the summary total, useless for the breakdown.
+
+```bash
+curl -X POST "http://localhost:3000/sync"                  # all registered sources
+curl -X POST "http://localhost:3000/sync?source=stripe"
+curl -X POST "http://localhost:3000/sync?source=paypal"
 curl "http://localhost:3000/revenue/summary?from=2026-07-01&to=2026-08-01"
 curl "http://localhost:3000/revenue/daily?from=2026-07-01&to=2026-08-01"
 curl "http://localhost:3000/revenue/unmapped?from=2026-07-01&to=2026-08-01"
 ```
-
-Stripe is optional at boot: without a key the service still starts and serves revenue for already-synced sources, and `/sync?source=stripe` returns 400.
 
 ### Environment
 
@@ -250,8 +287,14 @@ Stripe is optional at boot: without a key the service still starts and serves re
 | `PORT` | Render injects this |
 | `DATABASE_URL` | **Supabase connection POOLER string** — see below |
 | `STRIPE_SECRET_KEY` | Test-mode only; the app refuses a live key |
+| `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` | REST app credentials; needs **Transaction Search** enabled |
+| `PAYPAL_ENV` | `sandbox` (default) or `live` |
+| `PAYPAL_LOOKBACK_DAYS` | First-sync lookback, default `31` |
+| `ENABLE_CSV_SOURCE` | `true` registers the fixture source. Default off |
 | `LOG_LEVEL` | default `info` |
 | `PG_POOL_MAX` | default `3` |
+
+Every source is optional at boot. Missing credentials for one provider logs a warning and makes `/sync?source=<that>` return 400; the service still starts and still serves revenue for everything already synced. A metrics API that refuses to answer because an upstream is misconfigured is worse than one that answers from what it has.
 
 ---
 
@@ -309,9 +352,26 @@ Free-tier realities this is built around:
 
 **UTC only, no per-tenant timezone.** Making the bucketing timezone a parameter is a clean extension, but the agreement guarantee only holds if both views receive the same value — so it would have to be threaded through `parseRange`, not added at the query.
 
-**The second source is fixture-backed, not a second live sandbox.** It demonstrates vocabulary normalization — the actual requirement — without a second account's setup cost, and it lets the fixture be deliberately hostile (mixed casing, an amount above `Number.MAX_SAFE_INTEGER`, an unmappable status, a row that must be quarantined). The adapter interface is identical, so a real provider is a drop-in.
+**Three sources, two of them live.** Stripe and PayPal are real APIs; the CSV ledger is a fixture, off by default (`ENABLE_CSV_SOURCE`). It stays in the repo because it powers the credential-free `npm run demo` and because it can be deliberately hostile in ways a real sandbox won't cooperate with — mixed casing, padded whitespace, an amount above `Number.MAX_SAFE_INTEGER`, an unmappable status, and a row that must be quarantined.
+
+**Incremental sync is time-based, not cursor-based.** Both live adapters watermark on a timestamp rather than an object id. Stripe lists newest-first and `starting_after` pages toward *older* records, so an id cursor walks backwards through history and never sees anything new; PayPal's Transaction Search is queried by date range and has no cursor at all. Both deliberately re-fetch an overlap window (1 hour) so a transaction created either side of a run boundary is not lost — re-fetching is free because the upsert is idempotent, and missing a charge is not. Neither advances its watermark past a window it did not finish reading.
+
+**PayPal reports money as decimal strings**, which is where a float would otherwise enter a service that has none. [src/sources/decimal.ts](src/sources/decimal.ts) converts on the string: `19.99 * 100` is `1998.9999999999998` in IEEE-754, and past 2^53 the digits are simply gone. It also refuses precision the currency cannot represent (`10.005` USD) rather than rounding a half-cent into existence, and handles zero-decimal currencies (JPY, HUF, TWD) where treating `1500` as `15.00` would be a 100× error.
+
+**PayPal negative amounts** (refunds, payouts) are stored as positive amounts with status `REFUNDED`, not as negative revenue. A negative row would violate the CHECK constraint and, worse, would let an outflow quietly *reduce* a collected total instead of being excluded outright.
 
 **`occurred_at` is provider-reported, not ingest time.** Correct for a revenue metric — a charge belongs to the day it happened — but it means late-arriving data changes historical totals. The number is not append-only, and that is the right call for accuracy over stability.
+
+**Sync is upsert-only. Nothing is ever deleted, and there is no reconciliation.** If a record disappears upstream — a test clock is cleaned up, a sandbox is reset, a provider's retention policy expires it — the row stays in `transactions` and keeps contributing to revenue. The number does not change at all.
+
+This is a deliberate default rather than an oversight: you generally do not want a provider's retention policy silently rewriting your historical revenue, and an upstream outage that returns an empty page must never be able to zero out a month. But the cost is real, and it bounds the guarantee this service makes. "The number never drifts" is a claim about *how it is computed* — one definition, one code path, verified by tests — not a claim that it tracks upstream deletions.
+
+Closing the gap properly means one of two things, neither in scope here:
+
+- a **full reconciliation pass** that lists everything upstream for a window and soft-deletes local rows that are absent — expensive, and dangerous if a partial API response is mistaken for a deletion;
+- **webhook-driven invalidation** (`charge.refunded`, `charge.dispute.created`, PayPal equivalents), which is cheaper and more timely but needs a public endpoint, signature verification, and idempotent event handling.
+
+A soft-delete column plus an `excluded_at` predicate in `collectedPredicate()` would be the shape of the fix — and note it would go *in the canonical module*, not alongside it, so both views inherit it for free.
 
 **Tests use PGlite rather than a Postgres container.** The repository's SQL runs unmodified, so `date_trunc`, `ANY($1::text[])`, `BIGINT` arithmetic and the CHECK constraints are genuinely exercised with no Docker and no credentials in CI. The gap: PGlite is single-connection, so it does not exercise real pooler behaviour or concurrency.
 
@@ -324,7 +384,11 @@ Free-tier realities this is built around:
 ## Sources & references
 
 - [Stripe API — Charges](https://docs.stripe.com/api/charges) — chose Charges over PaymentIntents for the richer status vocabulary; `amount` is already integer minor units
-- [Stripe API — pagination](https://docs.stripe.com/api/pagination) — `has_more` / `starting_after`; list endpoints return 10 records without it
+- [Stripe API — pagination](https://docs.stripe.com/api/pagination) — `has_more` / `starting_after`; list endpoints return 10 records without it, and `starting_after` pages toward *older* records, which is what drove the switch to a time-based watermark
+- [PayPal — Transaction Search API](https://developer.paypal.com/docs/api/transaction-search/v1/) — `transaction_status` codes (`S`/`P`/`V`/`D`), the 31-day maximum window, and `page`/`total_pages` pagination
+- [PayPal — get an access token](https://developer.paypal.com/api/rest/authentication/) — OAuth2 client-credentials against `api-m.sandbox.paypal.com`
+- [PayPal — currency codes](https://developer.paypal.com/api/rest/reference/currency-codes/) — HUF, JPY and TWD take no decimal places, which the amount parser has to know
+- [ISO 4217 minor units](https://en.wikipedia.org/wiki/ISO_4217) — cross-checked the zero-decimal list
 - [Stripe — test cards and tokens](https://docs.stripe.com/testing) — `tok_visa`, `tok_chargeDeclined` for deterministic seed outcomes
 - [Stripe — refunds](https://docs.stripe.com/api/refunds) — confirmed a fully refunded charge keeps `status: "succeeded"`, which drove the effective-status handling
 - [Supabase — connecting to your database](https://supabase.com/docs/guides/database/connecting-to-postgres) — pooler vs direct connection; the IPv6 constraint on platforms like Render
@@ -349,5 +413,13 @@ This project was built with **Claude (Claude Code)**, used heavily and throughou
 2. Sync was idempotent for transactions but **not** for quarantine: re-running duplicated `quarantined_transactions` rows unboundedly. Caught by reading the demo output, not by a test. Fixed with a generated dedupe key plus `seen_count`, and a regression test added.
 
 A first-draft assertion also claimed `Number(x)` would preserve a value above `Number.MAX_SAFE_INTEGER`; it wouldn't, and the test now asserts the collapse explicitly to demonstrate why the `BigInt` comparison is the meaningful one.
+
+Three further defects surfaced only when the service met a real server rather than the test harness:
+
+3. **`.env` was never loaded** — `dotenv` was specified in the plan, never added to `package.json`, and never imported. Everything worked in tests, which set env directly, and failed the moment a real `DATABASE_URL` was needed.
+4. **The executor could not run a multi-statement batch.** `pg` selects the extended query protocol whenever a values array is passed — even an empty one — and that protocol rejects multiple statements; a simple-protocol batch then returns an *array* of results, so `res.rows` was `undefined`. The migration file is one such batch, so the very first real connection failed. The PGlite test wrapper had handled both cases correctly, so the test path was right while the production path was wrong — two implementations of the same thing, which is precisely what this project is about.
+5. **Stripe's incremental watermark ran backwards** — see the tradeoff note above. Caught by reasoning about the pagination direction while investigating an unrelated empty-sync report, not by a test.
+
+The pattern worth noting: the AI-written code was strongest where it had been told exactly what invariant to hold, and weakest at the seams between the system and the outside world — env loading, wire protocols, and a third-party API's ordering semantics. Those needed a real server to find.
 
 **Chat history:** _(paste your Claude conversation share link here)_
