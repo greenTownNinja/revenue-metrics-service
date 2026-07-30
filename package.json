@@ -13,6 +13,7 @@
     "dev": "tsx watch src/server.ts",
     "demo": "tsx scripts/demo.ts",
     "migrate": "tsx src/db/migrate.ts",
+    "demo:charge": "tsx scripts/demoStripeCharge.ts",
     "seed:stripe": "tsx scripts/seedStripe.ts",
     "seed:stripe:clock": "tsx scripts/seedStripeClock.ts",
     "seed:paypal": "tsx scripts/seedPaypal.ts",
