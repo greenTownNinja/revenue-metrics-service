@@ -21,8 +21,20 @@ services:
         value: info
       - key: PG_POOL_MAX
         value: "3"
+      - key: PAYPAL_ENV
+        value: sandbox
+      # How far back a first sync looks, before a watermark exists. PayPal's
+      # Transaction Search caps a single window at 31 days.
+      - key: PAYPAL_LOOKBACK_DAYS
+        value: "31"
       # Set these in the Render dashboard; never commit them.
       - key: DATABASE_URL
         sync: false
       - key: STRIPE_SECRET_KEY
+        sync: false
+      # Omit either one and PayPalAdapter.fromEnv() throws, so server.ts skips the
+      # source — the deploy still boots, with one fewer vocabulary than local.
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
         sync: false
