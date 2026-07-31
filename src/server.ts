@@ -12,7 +12,8 @@ import { createApp } from './app.js';
 import { createExecutor, closePool, getPool } from './db/pool.js';
 import { runMigrations } from './db/migrate.js';
 import { SyncService } from './sync/SyncService.js';
-import { StripeAdapter } from './sources/stripe/StripeAdapter.js';
+import type Stripe from 'stripe';
+import { StripeAdapter, stripeClientFromEnv } from './sources/stripe/StripeAdapter.js';
 import { PayPalAdapter } from './sources/paypal/PayPalAdapter.js';
 import { LedgerCsvAdapter } from './sources/ledgerCsv/LedgerCsvAdapter.js';
 import type { SourceAdapter } from './sources/SourceAdapter.js';
@@ -64,8 +65,19 @@ async function main(): Promise<void> {
     );
   }
 
+  // Powers POST /demo/stripe-charge. Built separately from the adapter because
+  // the adapter only reads; this writes. Same construction path, so the
+  // test-mode-key refusal applies to both. If Stripe is not configured the route
+  // is simply not registered.
+  let stripe: Stripe | undefined;
+  try {
+    stripe = stripeClientFromEnv();
+  } catch {
+    logger.warn('POST /demo/stripe-charge not registered (Stripe is not configured)');
+  }
+
   const syncService = new SyncService(db, adapters);
-  const app = createApp({ db, syncService });
+  const app = createApp({ db, syncService, stripe });
 
   const port = Number(process.env.PORT ?? 3000);
   const server = app.listen(port, () => {

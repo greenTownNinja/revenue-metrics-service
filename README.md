@@ -204,18 +204,113 @@ The operational answer to "did a new status appear?"
 }
 ```
 
+### `POST /demo/stripe-charge`
+
+Creates real test-mode charges in Stripe, syncs, and returns the metric **before and
+after** — so a browser (or a curl) can watch new money travel Stripe → Supabase →
+the number, in one call.
+
+```bash
+curl -X POST "$BASE/demo/stripe-charge" \
+  -H 'Content-Type: application/json' -d '{"count":5}'
+```
+
+```json
+{
+  "range": { "from": "2026-07-31", "to": "2026-08-01" },
+  "created": [
+    { "id": "ch_…", "amountMinor": 25000, "currency": "usd",
+      "countsTowardRevenue": true,
+      "note": "stripe:succeeded → COLLECTED (on the allow-list)" },
+    { "id": null, "amountMinor": 7500, "currency": "usd",
+      "countsTowardRevenue": false,
+      "note": "card declined → FAILED (not on the allow-list)" },
+    { "id": "ch_…", "amountMinor": 20000, "currency": "usd",
+      "countsTowardRevenue": false,
+      "note": "fully refunded → REFUNDED, even though Stripe still reports \"succeeded\"" }
+  ],
+  "sync":   { "source": "stripe", "fetched": 5, "upserted": 5, "quarantined": 0 },
+  "before": { "totals": [ { "currency": "usd", "amountMinor":  "94900" } ] },
+  "after":  { "totals": [ { "currency": "usd", "amountMinor": "129850" } ] }
+}
+```
+
+`count` is 1–5 and selects from a **fixed** plan of round amounts — the caller
+never chooses the values. Two of the five are deliberately not revenue: a declined
+card and a fully refunded charge. Both are genuinely present in Stripe, and
+neither appears in `after`. A demo where every new charge counts proves the sum
+works; it does not prove the allow-list does anything.
+
+**`before` and `after` are not computed here.** Both come from the same
+`RevenueService.getSummary()` call that backs `GET /revenue/summary`. The endpoint
+cannot derive a total of its own — it can only ask the canonical implementation
+twice and show you what it said. Deriving the delta server-side would mean this
+file knew what revenue meant, which is what the drift guard exists to prevent.
+
+Safety, given the route is public and unauthenticated:
+
+- the Stripe client comes from `stripeClientFromEnv()`, the same constructor the
+  read adapter uses, which **refuses any key that is not test-mode**
+- at most 5 charges per request, from a fixed plan
+- a process-wide 10s cooldown returning `429 RATE_LIMITED`, so a page left open in
+  a loop cannot fill the test account
+- the route is **not registered at all** when Stripe is unconfigured — `404`, not a
+  500 from a route that could never have worked
+
+The CLI equivalent is `npm run demo:charge` (add `--verify` to assert the delta).
+Both create charges through the same `src/sources/stripe/StripeDemoCharges.ts`, so
+there is one copy of the demo plan rather than two that drift.
+
 ### Errors
 
 | Condition | Status | Code |
 | --- | --- | --- |
 | Missing/malformed date, `from >= to`, range > 366 days | 400 | `VALIDATION_ERROR` |
 | Unknown `source` | 400 | `UNKNOWN_SOURCE` (lists available) |
+| Demo charges requested too fast | 429 | `RATE_LIMITED` (carries `retryAfterSeconds`) |
 | Stripe rejected our key/request | 502 | `UPSTREAM_CONFIG_ERROR` |
 | Stripe unreachable or 5xx | 503 | `UPSTREAM_UNAVAILABLE` |
 | Postgres unavailable | 500 | `DATABASE_ERROR` |
 | Unknown route | 404 | `NOT_FOUND` |
 
 `2026-02-30` is rejected: `new Date()` would roll it forward to March 2nd rather than failing.
+
+### Using this from a browser
+
+CORS is open to every origin, so a separately-hosted frontend can call the service directly:
+
+```js
+const BASE = 'https://revenue-metrics-service-r5p3.onrender.com';
+const res = await fetch(`${BASE}/revenue/daily?from=2026-07-01&to=2026-08-01`);
+const { days, definition } = await res.json();
+```
+
+`Access-Control-Allow-Origin: *` is safe here **because every endpoint is
+unauthenticated and cookie-free** — a browser attaches no ambient credentials, so
+a hostile page learns nothing it could not learn by curling the URL itself. If
+this service ever grows an API key or a session, the wildcard has to be replaced
+with an explicit origin list: `*` is invalid alongside
+`Access-Control-Allow-Credentials: true` and browsers reject it outright.
+
+The middleware is hand-rolled (a dozen lines in `src/app.ts`) rather than pulling
+in `cors`, and is registered before everything else so **error responses carry the
+headers too**. Without that, a 400 reaches the frontend as an opaque network
+failure and the actual validation message is unreadable — you would see
+`Failed to fetch` instead of `'from' must be strictly before 'to'`.
+
+`OPTIONS` returns 204 without reaching the route handler. That matters for
+`POST /sync`: if the preflight fell through, a browser merely *asking* whether it
+may sync would perform a sync. `tests/api.test.ts` pins this by asserting the
+totals are unchanged after a preflight.
+
+Two things that bite when consuming the JSON:
+
+- **`amountMinor` is a decimal string, not a number.** Totals here already exceed
+  `Number.MAX_SAFE_INTEGER`, so `JSON.parse` into a float would lose precision
+  silently. Use `BigInt(t.amountMinor)` for arithmetic, or keep the string for
+  display. This is the same reason the values cross the DB boundary as `::TEXT`.
+- **`to` is exclusive.** A picker showing "Jul 1 – Jul 31" must send
+  `to=2026-08-01`, or the last day is missing from both views.
 
 ---
 

@@ -43,6 +43,28 @@ const mapStatus = buildStatusMapper(STRIPE_VOCABULARY);
 
 const PAGE_SIZE = 100;
 
+/**
+ * Builds a Stripe client from the environment, refusing anything that is not a
+ * test-mode key.
+ *
+ * Exported because the demo-charge endpoint needs the same client under the same
+ * refusal. Sharing it means the "test mode only" rule cannot be enforced in one
+ * place and forgotten in the other — there is exactly one construction path.
+ */
+export function stripeClientFromEnv(): Stripe {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) {
+    throw new UpstreamConfigError(STRIPE_SOURCE, 'STRIPE_SECRET_KEY is not set');
+  }
+  if (!key.startsWith('sk_test_') && !key.startsWith('rk_test_')) {
+    throw new UpstreamConfigError(
+      STRIPE_SOURCE,
+      'STRIPE_SECRET_KEY must be a test-mode key (sk_test_… or rk_test_…)',
+    );
+  }
+  return new Stripe(key, { maxNetworkRetries: 3, timeout: 20_000 });
+}
+
 export class StripeAdapter implements SourceAdapter {
   readonly name = STRIPE_SOURCE;
   readonly vocabulary = STRIPE_VOCABULARY;
@@ -50,19 +72,7 @@ export class StripeAdapter implements SourceAdapter {
   constructor(private readonly stripe: Stripe) {}
 
   static fromEnv(): StripeAdapter {
-    const key = process.env.STRIPE_SECRET_KEY;
-    if (!key) {
-      throw new UpstreamConfigError(STRIPE_SOURCE, 'STRIPE_SECRET_KEY is not set');
-    }
-    if (!key.startsWith('sk_test_') && !key.startsWith('rk_test_')) {
-      throw new UpstreamConfigError(
-        STRIPE_SOURCE,
-        'STRIPE_SECRET_KEY must be a test-mode key (sk_test_… or rk_test_…)',
-      );
-    }
-    return new StripeAdapter(
-      new Stripe(key, { maxNetworkRetries: 3, timeout: 20_000 }),
-    );
+    return new StripeAdapter(stripeClientFromEnv());
   }
 
   /**

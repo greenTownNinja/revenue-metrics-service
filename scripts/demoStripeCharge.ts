@@ -21,6 +21,11 @@
 
 import 'dotenv/config';
 import Stripe from 'stripe';
+import {
+  createDemoCharges,
+  DEMO_CHARGE_PLAN,
+  MAX_DEMO_CHARGES,
+} from '../src/sources/stripe/StripeDemoCharges.js';
 
 const key = process.env.STRIPE_SECRET_KEY;
 if (!key) {
@@ -41,68 +46,11 @@ const BASE = (arg('base', 'http://localhost:3000') as string).replace(/\/$/, '')
 
 const stripe = new Stripe(key, { maxNetworkRetries: 3, timeout: 30_000 });
 
-interface DemoCharge {
-  label: string;
-  currency: string;
-  amount: number;
-  token: string;
-  refund?: 'full';
-  /** Whether this charge should end up inside the revenue number. */
-  counts: boolean;
-  /** Why it does or does not count — printed, so the demo explains itself. */
-  because: string;
-}
-
-/**
- * Round numbers on purpose. "$250.00" is something you can say out loud and a
- * viewer can add up; 2,371.09 is not.
- */
-const PLAN: DemoCharge[] = [
-  {
-    label: 'collected usd',
-    currency: 'usd',
-    amount: 25_000,
-    token: 'tok_visa',
-    counts: true,
-    because: 'stripe:succeeded → COLLECTED (on the allow-list)',
-  },
-  {
-    label: 'collected usd',
-    currency: 'usd',
-    amount: 9_950,
-    token: 'tok_visa',
-    counts: true,
-    because: 'stripe:succeeded → COLLECTED (on the allow-list)',
-  },
-  {
-    label: 'collected eur',
-    currency: 'eur',
-    amount: 12_000,
-    token: 'tok_visa',
-    counts: true,
-    because: 'stripe:succeeded → COLLECTED, and EUR totals stay separate',
-  },
-  {
-    label: 'declined usd',
-    currency: 'usd',
-    amount: 7_500,
-    token: 'tok_chargeDeclined',
-    counts: false,
-    because: 'card declined → FAILED (not on the allow-list)',
-  },
-  {
-    label: 'refunded usd',
-    currency: 'usd',
-    amount: 20_000,
-    token: 'tok_visa',
-    refund: 'full',
-    counts: false,
-    because: 'fully refunded → REFUNDED, even though Stripe still says "succeeded"',
-  },
-];
-
-const COUNT = Math.max(1, Math.min(PLAN.length, Number(arg('count', String(PLAN.length)))));
-const plan = PLAN.slice(0, COUNT);
+const COUNT = Math.max(
+  1,
+  Math.min(MAX_DEMO_CHARGES, Number(arg('count', String(MAX_DEMO_CHARGES)))),
+);
+const plan = DEMO_CHARGE_PLAN.slice(0, COUNT);
 
 /** UTC day these charges will land in — Stripe stamps `created` server-side. */
 const today = new Date().toISOString().slice(0, 10);
@@ -119,21 +67,22 @@ function money(minor: bigint | number, currency: string): string {
 
 /** What the collected total SHOULD move by, per currency. */
 const expected = new Map<string, bigint>();
-for (const c of plan.filter((c) => c.counts)) {
-  expected.set(c.currency, (expected.get(c.currency) ?? 0n) + BigInt(c.amount));
+for (const c of plan.filter((c) => c.countsTowardRevenue)) {
+  expected.set(c.currency, (expected.get(c.currency) ?? 0n) + BigInt(c.amountMinor));
 }
 
 function printPlan(): void {
   console.log(`\nCreating ${plan.length} charge(s) in Stripe test mode.\n`);
   for (const c of plan) {
-    const mark = c.counts ? '  COUNTS  ' : '  EXCLUDED';
-    console.log(`  ${mark}  ${money(c.amount, c.currency).padStart(14)}   ${c.because}`);
+    const mark = c.countsTowardRevenue ? '  COUNTS  ' : '  EXCLUDED';
+    console.log(`  ${mark}  ${money(c.amountMinor, c.currency).padStart(14)}   ${c.note}`);
   }
   console.log('\nExpected change to collected revenue:');
   for (const [currency, delta] of [...expected].sort()) {
     console.log(`    ${currency}  +${money(delta, currency)}`);
   }
-  const excluded = plan.filter((c) => !c.counts).reduce((a, c) => a + BigInt(c.amount), 0n);
+  let excluded = 0n;
+  for (const c of plan.filter((c) => !c.countsTowardRevenue)) excluded += BigInt(c.amountMinor);
   console.log(`    (${money(excluded, 'usd')} created but deliberately not counted)\n`);
 }
 
@@ -151,27 +100,11 @@ async function summary(): Promise<Map<string, bigint>> {
   return new Map(body.totals.map((t) => [t.currency, BigInt(t.amountMinor)]));
 }
 
+/** Creation itself lives in src/, shared with POST /demo/stripe-charge. */
 async function create(): Promise<void> {
-  for (const c of plan) {
-    try {
-      const charge = await stripe.charges.create({
-        amount: c.amount,
-        currency: c.currency,
-        source: c.token,
-        description: `revenue-metrics live demo: ${c.label}`,
-        metadata: { seed: 'revenue-metrics', demo: 'live', label: c.label },
-      });
-      if (c.refund === 'full') await stripe.refunds.create({ charge: charge.id });
-      console.log(`  ✓ ${charge.id}  ${money(c.amount, c.currency)}  ${c.label}`);
-    } catch (err) {
-      // A declined test card raises instead of returning a failed charge. Stripe
-      // still records the failed charge object, which is what we want to sync.
-      if (c.token === 'tok_chargeDeclined') {
-        console.log(`  ✓ declined as intended   ${money(c.amount, c.currency)}  ${c.label}`);
-      } else {
-        throw err;
-      }
-    }
+  for (const c of await createDemoCharges(stripe, COUNT)) {
+    const id = c.id ?? 'declined as intended';
+    console.log(`  ✓ ${id}  ${money(c.amountMinor, c.currency)}  ${c.label}`);
   }
 }
 

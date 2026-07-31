@@ -145,6 +145,52 @@ describe('API', () => {
     expect(body.error.code).toBe('NOT_FOUND');
   });
 
+  it('does not register the demo-charge route when Stripe is absent', async () => {
+    // A 404 is the honest answer for a route that could never have worked here.
+    const res = await fetch(`${base}/demo/stripe-charge`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as any;
+    expect(body.error.code).toBe('NOT_FOUND');
+  });
+
+  it('allows cross-origin reads from any origin', async () => {
+    const res = await fetch(`${base}/revenue/summary?from=2026-07-01&to=2026-08-01`, {
+      headers: { Origin: 'https://some-frontend.example' },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  it('answers a preflight for POST /sync without running the sync', async () => {
+    const before = await get('/revenue/summary?from=2026-07-01&to=2026-08-01');
+    const res = await fetch(`${base}/sync?source=ledger-csv`, {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://some-frontend.example',
+        'Access-Control-Request-Method': 'POST',
+        'Access-Control-Request-Headers': 'content-type',
+      },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-methods')).toContain('POST');
+    expect(res.headers.get('access-control-allow-headers')).toContain('Content-Type');
+
+    // A preflight must be a no-op. If OPTIONS fell through to the POST handler,
+    // a browser merely *asking* whether it may sync would perform a sync.
+    const after = await get('/revenue/summary?from=2026-07-01&to=2026-08-01');
+    expect(after.body.totals).toEqual(before.body.totals);
+  });
+
+  it('sends CORS headers on errors too, so the browser sees the real status', async () => {
+    // Without this a 400 reaches the frontend as an opaque network failure and
+    // the actual validation message is unreadable.
+    const res = await fetch(`${base}/revenue/summary?from=2026-08-01&to=2026-07-01`, {
+      headers: { Origin: 'https://some-frontend.example' },
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
   it('stays idempotent over HTTP', async () => {
     const before = await get('/revenue/summary?from=2026-07-01&to=2026-08-01');
     await post('/sync?source=ledger-csv');

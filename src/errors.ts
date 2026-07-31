@@ -27,6 +27,22 @@ export class ValidationError extends AppError {
   }
 }
 
+/**
+ * Caller is going too fast. 429.
+ *
+ * Used by the demo-charge endpoint, which is a public, unauthenticated write to
+ * a third-party API — without a limit, one page left open in a loop would fill
+ * the Stripe test account.
+ */
+export class RateLimitedError extends AppError {
+  readonly status = 429;
+  readonly code = 'RATE_LIMITED';
+
+  constructor(retryAfterSeconds: number) {
+    super(`Too many requests. Try again in ${retryAfterSeconds}s.`, { retryAfterSeconds });
+  }
+}
+
 /** Client asked for a source that does not exist. 400. */
 export class UnknownSourceError extends AppError {
   readonly status = 400;
