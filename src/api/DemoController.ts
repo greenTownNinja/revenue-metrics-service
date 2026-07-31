@@ -1,15 +1,18 @@
 /**
- * `POST /demo/stripe-charge` — creates real test-mode charges in Stripe, syncs,
- * and returns the metric before and after, so a browser can watch new money
- * arrive end to end.
+ * `POST /demo/stripe-charge` — creates real test-mode charges in Stripe and
+ * stops there.
  *
- * WHAT THIS DELIBERATELY DOES NOT DO. It does not compute an expected total, and
- * it does not add anything up. `before` and `after` both come from
- * RevenueService — the same call path `/revenue/summary` uses. The endpoint's
- * claim is "the number moved", and the only way it can make that claim is by
- * asking the one canonical implementation twice. Computing the delta server-side
- * would mean this file knew how to derive revenue, which is exactly what the
- * drift guard exists to prevent.
+ * IT DELIBERATELY DOES NOT SYNC. Ingestion stays an explicit, separate step, so
+ * a demo can show the honest sequence: the charges exist in Stripe, the metric
+ * has not moved, and only `POST /sync?source=stripe` brings them across. An
+ * endpoint that created and synced in one call would hide the very boundary this
+ * service is about — money in a provider is not revenue here until something
+ * ingests it.
+ *
+ * IT ALSO DOES NOT COMPUTE A TOTAL. `metricBeforeSync` comes from
+ * RevenueService, the same call path `/revenue/summary` uses. This file cannot
+ * derive revenue — it can only ask the one canonical implementation and report
+ * what it said. Deriving anything here is exactly what the drift guard prevents.
  *
  * SAFETY. The charges are real API calls, and the route is public and
  * unauthenticated (CORS is open). Three things bound the blast radius:
@@ -25,7 +28,6 @@ import type { Request, Response } from 'express';
 import type Stripe from 'stripe';
 import { z } from 'zod';
 import type { RevenueService } from '../revenue/RevenueService.js';
-import type { SyncService } from '../sync/SyncService.js';
 import { RateLimitedError, ValidationError } from '../errors.js';
 import { currencyTotalJson } from './serialize.js';
 import { STRIPE_SOURCE } from '../sources/stripe/StripeAdapter.js';
@@ -58,7 +60,6 @@ export class DemoController {
 
   constructor(
     private readonly revenue: RevenueService,
-    private readonly sync: SyncService,
     private readonly stripe: Stripe,
   ) {}
 
@@ -79,33 +80,30 @@ export class DemoController {
 
     const range = todayUtcRange();
 
-    // Read the baseline BEFORE creating anything, through the canonical service.
-    const before = await this.revenue.getSummary(range);
-
     const created = await createDemoCharges(this.stripe, parsed.data.count ?? MAX_DEMO_CHARGES);
 
-    const syncReport = await this.sync.syncSource(STRIPE_SOURCE);
-
-    const after = await this.revenue.getSummary(range);
-
-    // Same serializer the /revenue endpoints use: amounts leave as decimal
-    // strings, never JSON numbers. Express would otherwise throw on the BigInt.
-    const totals = (s: typeof before) => ({
-      sources: s.sources,
-      totals: s.totals.map(currencyTotalJson),
-    });
+    // Read AFTER creating, and deliberately BEFORE any sync. This is the whole
+    // point of the endpoint: the charges now exist in Stripe and the metric has
+    // not moved, because nothing has ingested them yet. Money in a provider is
+    // not revenue in this service until a sync brings it across.
+    const metric = await this.revenue.getSummary(range);
 
     res.status(201).json({
       range,
-      definition: before.definition,
+      definition: metric.definition,
       created,
-      sync: syncReport,
-      before: totals(before),
-      after: totals(after),
+      // Same serializer the /revenue endpoints use: amounts leave as decimal
+      // strings, never JSON numbers. Express would otherwise throw on the BigInt.
+      metricBeforeSync: {
+        sources: metric.sources,
+        totals: metric.totals.map(currencyTotalJson),
+      },
+      nextStep: `POST /sync?source=${STRIPE_SOURCE}, then GET /revenue/summary?from=${range.from}&to=${range.to}`,
       note:
-        'before/after both come from the same RevenueService call that ' +
-        '/revenue/summary uses. Charges marked countsTowardRevenue:false are real ' +
-        'in Stripe and deliberately absent from the totals.',
+        'These charges are live in Stripe and NOT yet in the metric. metricBeforeSync ' +
+        'comes from the same RevenueService call /revenue/summary uses, so it is the ' +
+        'baseline to compare against after you sync. Charges marked ' +
+        'countsTowardRevenue:false will stay out of the total even then.',
     });
   };
 }

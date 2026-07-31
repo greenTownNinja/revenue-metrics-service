@@ -95,35 +95,47 @@ async function demoCharge(body: unknown): Promise<{ status: number; body: any }>
 }
 
 describe('POST /demo/stripe-charge', () => {
-  it('moves the metric by the collected charges only', async () => {
+  it('creates the charges without moving the metric, then syncing moves it by the collected ones', async () => {
     const { status, body } = await demoCharge({});
     expect(status).toBe(201);
 
-    // Every charge in the plan was really created.
+    // Every charge in the plan really exists in Stripe now.
     expect(body.created).toHaveLength(DEMO_CHARGE_PLAN.length);
-    expect(body.sync.upserted).toBe(DEMO_CHARGE_PLAN.length);
+    expect(ledger).toHaveLength(DEMO_CHARGE_PLAN.length);
+
+    // …and none of it is revenue yet, because nothing has ingested it. This is
+    // the property the endpoint exists to demonstrate: creating money upstream
+    // does not change the number.
+    expect(body.metricBeforeSync.totals).toEqual([]);
+    expect(body).not.toHaveProperty('sync');
+
+    const totalFor = (totals: { currency: string; amountMinor: string }[], currency: string) => {
+      const row = totals.find((t) => t.currency === currency);
+      return row ? BigInt(row.amountMinor) : 0n;
+    };
+
+    // The explicit second step a caller has to take.
+    const syncRes = await fetch(`${base}/sync?source=stripe`, { method: 'POST' });
+    expect(syncRes.status).toBe(200);
+    expect(((await syncRes.json()) as any).upserted).toBe(DEMO_CHARGE_PLAN.length);
+
+    const after = (await fetch(
+      `${base}/revenue/summary?from=${body.range.from}&to=${body.range.to}`,
+    ).then((r) => r.json())) as any;
 
     const collected = DEMO_CHARGE_PLAN.filter((c) => c.countsTowardRevenue);
     const excluded = DEMO_CHARGE_PLAN.filter((c) => !c.countsTowardRevenue);
     expect(excluded.length).toBeGreaterThan(0); // the demo must exclude something
-
-    const totalFor = (side: 'before' | 'after', currency: string): bigint => {
-      const row = body[side].totals.find((t: { currency: string }) => t.currency === currency);
-      return row ? BigInt(row.amountMinor) : 0n;
-    };
 
     for (const currency of new Set(DEMO_CHARGE_PLAN.map((c) => c.currency))) {
       let want = 0n;
       for (const c of collected.filter((c) => c.currency === currency)) {
         want += BigInt(c.amountMinor);
       }
-      const got = totalFor('after', currency) - totalFor('before', currency);
-      expect(got).toBe(want);
+      // Baseline was empty, so the after-total IS the delta. The declined and
+      // fully-refunded charges are in Stripe and in Postgres, but not in here.
+      expect(totalFor(after.totals, currency)).toBe(want);
     }
-
-    // And the excluded ones are genuinely in Stripe, not merely skipped.
-    const declined = body.created.find((c: { countsTowardRevenue: boolean }) => !c.countsTowardRevenue);
-    expect(declined).toBeDefined();
   });
 
   it('rate-limits a second immediate request', async () => {

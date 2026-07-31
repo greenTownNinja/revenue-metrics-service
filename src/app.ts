@@ -114,8 +114,8 @@ export function createApp(deps: AppDeps): Application {
         ...(deps.stripe
           ? {
               demoCharge:
-                'POST /demo/stripe-charge {"count":1-5} — creates test charges, syncs, ' +
-                'returns the metric before and after',
+                'POST /demo/stripe-charge {"count":1-5} — creates test charges in Stripe ' +
+                'only; sync separately to bring them into the metric',
             }
           : {}),
       },
@@ -129,7 +129,7 @@ export function createApp(deps: AppDeps): Application {
   app.get('/revenue/unmapped', wrap(revenue.unmapped));
 
   if (deps.stripe) {
-    const demo = new DemoController(revenueService, deps.syncService, deps.stripe);
+    const demo = new DemoController(revenueService, deps.stripe);
     app.post('/demo/stripe-charge', wrap(demo.stripeCharge));
   }
 

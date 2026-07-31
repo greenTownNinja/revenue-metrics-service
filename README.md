@@ -206,9 +206,8 @@ The operational answer to "did a new status appear?"
 
 ### `POST /demo/stripe-charge`
 
-Creates real test-mode charges in Stripe, syncs, and returns the metric **before and
-after** — so a browser (or a curl) can watch new money travel Stripe → Supabase →
-the number, in one call.
+Creates real test-mode charges in Stripe **and stops there**, so you can watch new
+money travel Stripe → Supabase → the metric one deliberate step at a time.
 
 ```bash
 curl -X POST "$BASE/demo/stripe-charge" \
@@ -229,23 +228,37 @@ curl -X POST "$BASE/demo/stripe-charge" \
       "countsTowardRevenue": false,
       "note": "fully refunded → REFUNDED, even though Stripe still reports \"succeeded\"" }
   ],
-  "sync":   { "source": "stripe", "fetched": 5, "upserted": 5, "quarantined": 0 },
-  "before": { "totals": [ { "currency": "usd", "amountMinor":  "94900" } ] },
-  "after":  { "totals": [ { "currency": "usd", "amountMinor": "129850" } ] }
+  "metricBeforeSync": { "totals": [ { "currency": "usd", "amountMinor": "154850" } ] },
+  "nextStep": "POST /sync?source=stripe, then GET /revenue/summary?from=…&to=…"
 }
 ```
 
+**It does not sync.** Ingestion stays a separate, explicit call, which makes the
+honest sequence visible:
+
+```bash
+curl -X POST "$BASE/demo/stripe-charge" -d '{"count":3}' -H 'Content-Type: application/json'
+curl -s  "$BASE/revenue/summary?from=2026-07-31&to=2026-08-01"   # unchanged: usd 154850
+curl -X POST "$BASE/sync?source=stripe"                           # upserted: 14
+curl -s  "$BASE/revenue/summary?from=2026-07-31&to=2026-08-01"   # usd 189800  (+34950)
+```
+
+Money existing in a provider is not revenue in this service until something
+ingests it. An endpoint that created and synced in one call would hide exactly
+that boundary.
+
 `count` is 1–5 and selects from a **fixed** plan of round amounts — the caller
 never chooses the values. Two of the five are deliberately not revenue: a declined
-card and a fully refunded charge. Both are genuinely present in Stripe, and
-neither appears in `after`. A demo where every new charge counts proves the sum
-works; it does not prove the allow-list does anything.
+card and a fully refunded charge. Both are genuinely present in Stripe and in
+Postgres after the sync, and neither ever reaches the total. A demo where every
+new charge counts proves the sum works; it does not prove the allow-list does
+anything.
 
-**`before` and `after` are not computed here.** Both come from the same
-`RevenueService.getSummary()` call that backs `GET /revenue/summary`. The endpoint
-cannot derive a total of its own — it can only ask the canonical implementation
-twice and show you what it said. Deriving the delta server-side would mean this
-file knew what revenue meant, which is what the drift guard exists to prevent.
+**`metricBeforeSync` is not computed here.** It comes from the same
+`RevenueService.getSummary()` call that backs `GET /revenue/summary`, so it is a
+directly comparable baseline. This endpoint cannot derive a total of its own —
+doing so would mean it knew what revenue meant, which is what the drift guard
+exists to prevent.
 
 Safety, given the route is public and unauthenticated:
 
