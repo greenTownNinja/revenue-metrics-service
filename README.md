@@ -4,11 +4,23 @@ One canonical "total revenue collected" across multiple payment sources, exposed
 
 Transactions arrive from source systems with different status vocabularies — Stripe says `succeeded`, PayPal says `S`, an invoice ledger says `paid` or `completed`. All of them normalize onto one closed canonical enum, and revenue is computed from an **allow-list** of statuses that count, in exactly one place in the codebase. A summary endpoint and a day-by-day endpoint read that same code path, and a CI guard fails the build if a second, divergent calculation is ever introduced.
 
-**Live sources:** Stripe test mode and PayPal sandbox, both over their real APIs.
-
-**Live deployment:** _(fill in your Render URL)_ — e.g. `https://revenue-metrics-service.onrender.com`
+| | |
+| --- | --- |
+| **Live deployment** | https://revenue-metrics-service-r5p3.onrender.com |
+| **Repository** | https://github.com/greenTownNinja/revenue-metrics-service |
+| **AI usage transcript** | [AI_TRANSCRIPT.md](AI_TRANSCRIPT.md) — full session, credentials redacted |
+| **Postman collection** | [postman_collection.json](postman_collection.json) — 15 requests, import and run |
+| **Live sources** | Stripe test mode and PayPal sandbox, both over their real APIs |
 
 > Render's free tier spins the instance down when idle. The first request after a pause takes ~50 seconds while Node boots. Hit `/health` first.
+
+```bash
+BASE=https://revenue-metrics-service-r5p3.onrender.com
+curl -s "$BASE/health"
+curl -s "$BASE/revenue/summary?from=2026-02-01&to=2026-08-01"
+curl -s "$BASE/revenue/daily?from=2026-02-01&to=2026-08-01"    # sums to the line above
+curl -s "$BASE/revenue/unmapped?from=2026-02-01&to=2026-08-01" # what the allow-list kept out
+```
 
 ---
 
@@ -22,7 +34,7 @@ npm run demo
 This boots the real Express app against [PGlite](https://pglite.dev) (Postgres compiled to WASM, in-process) and the CSV source, then walks through a sync, both views agreeing, and each edge case. No Supabase project and no Stripe key required.
 
 ```bash
-npm test        # 67 tests, including the drift guard
+npm test        # 93 tests, including the drift guard
 npm run typecheck
 ```
 
@@ -522,13 +534,25 @@ A soft-delete column plus an `excluded_at` predicate in `collectedPredicate()` w
 - [ISO 4217 minor units](https://en.wikipedia.org/wiki/ISO_4217) — cross-checked the zero-decimal list
 - [Stripe — test cards and tokens](https://docs.stripe.com/testing) — `tok_visa`, `tok_chargeDeclined` for deterministic seed outcomes
 - [Stripe — refunds](https://docs.stripe.com/api/refunds) — confirmed a fully refunded charge keeps `status: "succeeded"`, which drove the effective-status handling
+- [Stripe — test clocks, advanced usage](https://docs.stripe.com/billing/testing/test-clocks/api-advanced-usage) — the 2-billing-cycles-per-advance and 20-invoices-per-subscription-per-day limits, and the 3-customers-per-clock cap. Used to try to produce backdated charges; **the docs do not say whether a clock backdates `charge.created`, and measurement showed it does not** — see the tradeoff note
 - [Supabase — connecting to your database](https://supabase.com/docs/guides/database/connecting-to-postgres) — pooler vs direct connection; the IPv6 constraint on platforms like Render
 - [Render — free tier / spin-down behaviour](https://render.com/docs/free) and [Blueprints](https://render.com/docs/infrastructure-as-code)
 - [node-postgres — data types](https://node-postgres.com/features/types) — why `INT8` arrives as a string and needs an explicit type parser
 - [PostgreSQL — `date_trunc` and `AT TIME ZONE`](https://www.postgresql.org/docs/current/functions-datetime.html) and [generated columns](https://www.postgresql.org/docs/current/ddl-generated-columns.html) (quarantine dedupe key)
 - [PostgreSQL — `INSERT ... ON CONFLICT`](https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT) — also the reason inserted/updated aren't reported separately (the `xmax` trick adds fragility for no analytic value)
 - [PGlite](https://pglite.dev/docs/) — real Postgres in WASM, for credential-free tests
-- Libraries: `express`, `pg`, `stripe`, `zod`, `pino` / `pino-http`, `vitest`, `tsx`, `typescript`
+- [MDN — CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) and [preflight](https://developer.mozilla.org/en-US/docs/Glossary/Preflight_request) — specifically that `Access-Control-Allow-Origin: *` is invalid alongside `Allow-Credentials: true`, which is why the wildcard is only safe while every endpoint stays unauthenticated
+- [Postman — collection format v2.1](https://schema.postman.com/) — for the committed collection
+
+**Free-tier accounts used:** Supabase (Postgres), Render (web service), Stripe (test mode), PayPal (developer sandbox).
+
+**Libraries:** `express`, `pg`, `stripe`, `zod`, `pino` / `pino-http`, `dotenv`; dev: `vitest`, `tsx`, `typescript`, `@electric-sql/pglite`.
+
+**Where the docs ran out.** Three things could not be resolved by reading and had to be measured against the live APIs:
+
+1. Whether a Stripe test clock backdates `charge.created` as well as `invoice.created`. **It does not** — 54 invoices spread over 18 days, every resulting charge stamped with real wall-clock time.
+2. What PayPal's Transaction Search returns for a window inside its reporting lag. Not an empty page — **`404 INVALID_REQUEST`** for any `start_date` newer than roughly `now-2h`, measured by bisecting: `now-60m` → 404, `now-120m` → 200.
+3. Why `pg` rejected a multi-statement migration. The behaviour is a consequence of passing a values array selecting the extended query protocol; the docs describe both protocols but not that an *empty* array is enough to trigger the switch.
 
 ---
 
@@ -551,6 +575,14 @@ Three further defects surfaced only when the service met a real server rather th
 4. **The executor could not run a multi-statement batch.** `pg` selects the extended query protocol whenever a values array is passed — even an empty one — and that protocol rejects multiple statements; a simple-protocol batch then returns an *array* of results, so `res.rows` was `undefined`. The migration file is one such batch, so the very first real connection failed. The PGlite test wrapper had handled both cases correctly, so the test path was right while the production path was wrong — two implementations of the same thing, which is precisely what this project is about.
 5. **Stripe's incremental watermark ran backwards** — see the tradeoff note above. Caught by reasoning about the pagination direction while investigating an unrelated empty-sync report, not by a test.
 
-The pattern worth noting: the AI-written code was strongest where it had been told exactly what invariant to hold, and weakest at the seams between the system and the outside world — env loading, wire protocols, and a third-party API's ordering semantics. Those needed a real server to find.
+Three more surfaced once the service was deployed and driven from a browser:
 
-**Chat history:** _(paste your Claude conversation share link here)_
+6. **A live `503` from PayPal.** Every sync failed with `UPSTREAM_UNAVAILABLE`. The cause was worse than the symptom: the adapter advanced its watermark to `now`, but PayPal cannot see the last ~3 hours, so transactions inside that window fell *behind* the watermark before ever being fetched — silent, permanent data loss. The 404 was the visible half of a bug whose invisible half was losing money from the metric. Fixed by clamping both the query window and the watermark to `now - 3h`; three regression tests pin it.
+7. **The demo endpoint returned `500 Do not know how to serialize a BigInt`** on its first run, because it built its own response instead of using the existing `currencyTotalJson` serializer — the one place that exists precisely so amounts leave as decimal strings.
+8. **A redaction pass that looked clean and wasn't.** The first export of this transcript replaced full-length secrets but missed truncated ones (a key abbreviated to its first few characters in a summary table). Rescanning found three survivors. Prefix-anchored patterns fixed it — a reminder that "grep found nothing" is only as good as the pattern.
+
+The pattern worth noting: the AI-written code was strongest where it had been told exactly what invariant to hold, and weakest at the seams between the system and the outside world — env loading, wire protocols, a third-party API's ordering semantics, and another's reporting lag. Every one of those needed a real server, a real API, or a real browser to find. None were caught by tests written before the fact; several are now covered by tests written after it.
+
+**What I asked for and rejected.** I declined an invoice-based Stripe adapter (an invoice and its charge are the same money — it would have double-counted), and rejected a first proposal to sync inside `POST /demo/stripe-charge`, because collapsing create-and-sync into one call hides the exact boundary the project is about: money in a provider is not revenue here until something ingests it.
+
+**Chat history:** [AI_TRANSCRIPT.md](AI_TRANSCRIPT.md) — the complete session, 51 turns, exported from Claude Code. Credentials are replaced with `«PLACEHOLDER»` markers and tool calls are collapsed to one line each; nothing else is edited. Claude Code runs in the terminal rather than at claude.ai, so there is no hosted share link — this file is the export.

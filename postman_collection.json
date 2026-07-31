@@ -1,0 +1,223 @@
+{
+  "info": {
+    "name": "Revenue Metrics Service",
+    "description": "One canonical collected-revenue metric across Stripe, PayPal and a CSV ledger, exposed through two views that cannot disagree.\n\nSet the `baseUrl` variable to switch between the deployed service and a local one.\n\nNOTES\n- `to` is EXCLUSIVE. A range covering all of July is from=2026-07-01&to=2026-08-01.\n- All bucketing is UTC.\n- `amountMinor` is integer minor units in a STRING. Totals here exceed Number.MAX_SAFE_INTEGER, so parsing to a float loses precision.\n- The free Render instance sleeps when idle; the first request after a pause takes ~50s. Call Health first.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://revenue-metrics-service-r5p3.onrender.com",
+      "type": "string"
+    },
+    { "key": "from", "value": "2026-02-01", "type": "string" },
+    { "key": "to", "value": "2026-08-01", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "0. Health — wakes the instance, states the definition",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] },
+        "description": "Cheap DB round-trip plus the canonical definition. 200 when Postgres answers, 503 when it does not. Run this first — the free tier spins down when idle."
+      }
+    },
+    {
+      "name": "1. Root — self-describing endpoint list",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "{{baseUrl}}/", "host": ["{{baseUrl}}"], "path": [""] },
+        "description": "Every route, plus the definition and the range semantics."
+      }
+    },
+    {
+      "name": "2. Summary — full range (the headline number)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/summary?from={{from}}&to={{to}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "summary"],
+          "query": [
+            { "key": "from", "value": "{{from}}" },
+            { "key": "to", "value": "{{to}}" }
+          ]
+        },
+        "description": "Total collected revenue per currency. The USD figure is above Number.MAX_SAFE_INTEGER — that is the BIGINT path carrying a real value, which is why amounts are serialized as strings."
+      }
+    },
+    {
+      "name": "3. Daily — the same number, per UTC day",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/daily?from={{from}}&to={{to}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "daily"],
+          "query": [
+            { "key": "from", "value": "{{from}}" },
+            { "key": "to", "value": "{{to}}" }
+          ]
+        },
+        "description": "Summing `days` per currency reproduces the summary exactly. Both views are built from one shared SQL clause factory and differ only by a date_trunc grouping key, so agreement is by construction rather than by test."
+      }
+    },
+    {
+      "name": "4. Daily — one week (small enough to read on screen)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/daily?from=2026-07-01&to=2026-07-08",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "daily"],
+          "query": [
+            { "key": "from", "value": "2026-07-01" },
+            { "key": "to", "value": "2026-07-08" }
+          ]
+        },
+        "description": "Seven days, ledger source only."
+      }
+    },
+    {
+      "name": "5. Unmapped — what the allow-list kept OUT",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/unmapped?from={{from}}&to={{to}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "unmapped"],
+          "query": [
+            { "key": "from", "value": "{{from}}" },
+            { "key": "to", "value": "{{to}}" }
+          ]
+        },
+        "description": "Statuses no adapter recognised (`disputed`, `on_hold`), with the amount each held out of revenue. An exclusion list such as `status != 'failed'` would have counted all of it. Excluding an unknown status is only safe if somebody finds out it appeared."
+      }
+    },
+    {
+      "name": "6. Sync — Stripe",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/sync?source=stripe",
+          "host": ["{{baseUrl}}"],
+          "path": ["sync"],
+          "query": [{ "key": "source", "value": "stripe" }]
+        },
+        "description": "Idempotent upsert on (source, external_id). Run it twice — `fetched`/`upserted` show real work, and the revenue totals do not move."
+      }
+    },
+    {
+      "name": "7. Sync — PayPal",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/sync?source=paypal",
+          "host": ["{{baseUrl}}"],
+          "path": ["sync"],
+          "query": [{ "key": "source", "value": "paypal" }]
+        },
+        "description": "PayPal's Transaction Search lags up to 3 hours, so the adapter never queries or advances its watermark past now-3h. `fetched: 0` means caught up, not broken."
+      }
+    },
+    {
+      "name": "8. Sync — all sources",
+      "request": {
+        "method": "POST",
+        "url": { "raw": "{{baseUrl}}/sync", "host": ["{{baseUrl}}"], "path": ["sync"] },
+        "description": "Returns 207 when some sources succeeded and others failed, so failures are not hidden behind a 200."
+      }
+    },
+    {
+      "name": "9. Demo — create Stripe charges (does NOT sync)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\n  \"count\": 5\n}" },
+        "url": {
+          "raw": "{{baseUrl}}/demo/stripe-charge",
+          "host": ["{{baseUrl}}"],
+          "path": ["demo", "stripe-charge"]
+        },
+        "description": "Creates real test-mode charges and stops. Two of the five are deliberately not revenue: a declined card and a fully refunded charge. Both are genuinely in Stripe and neither ever reaches the total.\n\nRun 6 (Sync Stripe) next, then 2 (Summary) — the number moves by the collected charges only. count is 1-5; a 10s cooldown returns 429."
+      }
+    },
+    {
+      "name": "E1. Error — reversed range",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/summary?from=2026-07-31&to=2026-07-01",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "summary"],
+          "query": [
+            { "key": "from", "value": "2026-07-31" },
+            { "key": "to", "value": "2026-07-01" }
+          ]
+        },
+        "description": "400. Rejected rather than silently swapped — silent swapping is a correctness bug wearing a convenience costume."
+      }
+    },
+    {
+      "name": "E2. Error — impossible date",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/summary?from=2026-02-30&to=2026-03-01",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "summary"],
+          "query": [
+            { "key": "from", "value": "2026-02-30" },
+            { "key": "to", "value": "2026-03-01" }
+          ]
+        },
+        "description": "400. new Date('2026-02-30') rolls forward to March 2nd rather than failing, so the parser compares an ISO round-trip instead."
+      }
+    },
+    {
+      "name": "E3. Error — range too large",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/summary?from=2020-01-01&to=2026-08-01",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "summary"],
+          "query": [
+            { "key": "from", "value": "2020-01-01" },
+            { "key": "to", "value": "2026-08-01" }
+          ]
+        },
+        "description": "400. Maximum span is 366 days."
+      }
+    },
+    {
+      "name": "E4. Error — unknown source",
+      "request": {
+        "method": "POST",
+        "url": {
+          "raw": "{{baseUrl}}/sync?source=square",
+          "host": ["{{baseUrl}}"],
+          "path": ["sync"],
+          "query": [{ "key": "source", "value": "square" }]
+        },
+        "description": "400 UNKNOWN_SOURCE, listing the sources that are registered."
+      }
+    },
+    {
+      "name": "E5. Error — empty range",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/revenue/summary?from=2027-01-01&to=2027-02-01",
+          "host": ["{{baseUrl}}"],
+          "path": ["revenue", "summary"],
+          "query": [
+            { "key": "from", "value": "2027-01-01" },
+            { "key": "to", "value": "2027-02-01" }
+          ]
+        },
+        "description": "200 with empty totals, empty sources, and no days. No crash, no null."
+      }
+    }
+  ]
+}
