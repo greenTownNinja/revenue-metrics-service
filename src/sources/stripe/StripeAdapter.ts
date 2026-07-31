@@ -146,8 +146,22 @@ export class StripeAdapter implements SourceAdapter {
   }
 }
 
-/** Seconds of deliberate overlap between runs. See fetch(). */
-const OVERLAP_SECONDS = 3600;
+/**
+ * Seconds of deliberate overlap between runs — how far BEFORE the watermark each
+ * sync starts reading. See fetch().
+ *
+ * Configurable for the same reason as PayPal's: a watermark is where the last run
+ * got to, not a safe exact resume point, and re-reading is free because the upsert
+ * is keyed on (source, external_id). Raise `STRIPE_OVERLAP_HOURS` to 24 to have
+ * every sync re-ingest a full day — useful as a live demonstration that
+ * re-ingestion cannot move the revenue total.
+ */
+const DEFAULT_OVERLAP_HOURS = 1;
+const OVERLAP_SECONDS = (() => {
+  const raw = Number(process.env.STRIPE_OVERLAP_HOURS ?? DEFAULT_OVERLAP_HOURS);
+  const hours = Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_OVERLAP_HOURS;
+  return Math.round(hours * 3600);
+})();
 
 /** Watermark is a unix-seconds string. Anything unparseable means "full sync". */
 function parseWatermark(cursor: string | null): number | null {

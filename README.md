@@ -462,7 +462,19 @@ Free-tier realities this is built around:
 
 **Three sources, two of them live.** Stripe and PayPal are real APIs; the CSV ledger is a fixture, off by default (`ENABLE_CSV_SOURCE`). It stays in the repo because it powers the credential-free `npm run demo` and because it can be deliberately hostile in ways a real sandbox won't cooperate with — mixed casing, padded whitespace, an amount above `Number.MAX_SAFE_INTEGER`, an unmappable status, and a row that must be quarantined.
 
-**Incremental sync is time-based, not cursor-based.** Both live adapters watermark on a timestamp rather than an object id. Stripe lists newest-first and `starting_after` pages toward *older* records, so an id cursor walks backwards through history and never sees anything new; PayPal's Transaction Search is queried by date range and has no cursor at all. Both deliberately re-fetch an overlap window (1 hour) so a transaction created either side of a run boundary is not lost — re-fetching is free because the upsert is idempotent, and missing a charge is not. Neither advances its watermark past a window it did not finish reading.
+**Incremental sync is time-based, not cursor-based.** Both live adapters watermark on a timestamp rather than an object id. Stripe lists newest-first and `starting_after` pages toward *older* records, so an id cursor walks backwards through history and never sees anything new; PayPal's Transaction Search is queried by date range and has no cursor at all. Both deliberately re-fetch an overlap window so a transaction created either side of a run boundary is not lost — re-fetching is free because the upsert is idempotent, and missing a charge is not. Neither advances its watermark past a window it did not finish reading.
+
+**The overlap is a knob, not a constant** — `PAYPAL_OVERLAP_HOURS` / `STRIPE_OVERLAP_HOURS`, default `1`. A watermark records where the last run got to; it is not a safe exact resume point, because providers surface late-settled and backdated records behind it. Every sync therefore starts reading *before* the watermark rather than at it. Raising the overlap to `24` makes each sync re-ingest a full day: strictly safer, linear in cost, and it makes idempotency observable rather than asserted —
+
+```
+POST /sync?source=paypal   → fetched 109, upserted 109
+POST /sync?source=stripe   → fetched 140, upserted 140
+GET  /revenue/summary      → eur 1830280   gbp 3831928   usd 4658005   (unchanged)
+POST /sync?source=paypal   → fetched 109, upserted 109
+GET  /revenue/summary      → eur 1830280   gbp 3831928   usd 4658005   (still unchanged)
+```
+
+249 transactions re-ingested, not one minor unit moved. A pipeline that inserted rather than upserted would have doubled the total twice over.
 
 **PayPal's watermark stops three hours behind real time.** PayPal documents up to a three-hour delay before an executed transaction appears in Transaction Search, and measurement on 2026-07-31 showed the API does not return an empty page for a window that recent — it answers `404 INVALID_REQUEST "Data for the given start date is not available."` for any `start_date` newer than roughly `now-2h`:
 

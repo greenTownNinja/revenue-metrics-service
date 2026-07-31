@@ -208,6 +208,33 @@ describe('PayPal reporting horizon', () => {
     return { client, windows };
   }
 
+  it('starts reading a configurable span BEFORE the watermark, not at it', async () => {
+    // The watermark is where the last run got to, not a safe exact resume point:
+    // providers surface late-settled and backdated records behind it. A 24h
+    // overlap re-reads a full day every run, which the idempotent upsert makes
+    // free — and which is what keeps a demo showing real fetched counts.
+    const { client, windows } = spyClient();
+    const overlapHours = 24;
+    const adapter = new PayPalAdapter(client, 31, overlapHours * HOUR);
+    const watermark = new Date(Date.now() - 6 * HOUR);
+
+    await adapter.fetch({ cursor: watermark.toISOString(), maxPages: 10 });
+
+    expect(windows.length).toBeGreaterThan(0);
+    const earliest = Math.min(...windows.map((w) => w.start.getTime()));
+    expect(earliest).toBeCloseTo(watermark.getTime() - overlapHours * HOUR, -4);
+
+    // With a 1h overlap the same watermark yields a materially later start —
+    // proving the span is doing the work, not some fixed constant.
+    const narrow = spyClient();
+    await new PayPalAdapter(narrow.client, 31, HOUR).fetch({
+      cursor: watermark.toISOString(),
+      maxPages: 10,
+    });
+    const narrowEarliest = Math.min(...narrow.windows.map((w) => w.start.getTime()));
+    expect(narrowEarliest).toBeGreaterThan(earliest);
+  });
+
   it('never requests a window reaching into the last three hours', async () => {
     const { client, windows } = spyClient();
     const adapter = new PayPalAdapter(client);

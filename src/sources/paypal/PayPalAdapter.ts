@@ -48,8 +48,31 @@ const mapStatus = buildStatusMapper(PAYPAL_VOCABULARY);
 
 const PAGE_SIZE = 100;
 const MS_PER_DAY = 86_400_000;
-/** Re-fetch window across runs; the upsert makes overlap free. */
-const OVERLAP_MS = 60 * 60 * 1000;
+const MS_PER_HOUR = 3_600_000;
+
+/**
+ * How far BEFORE the watermark each sync starts reading, in hours.
+ *
+ * A watermark alone is not enough. A provider can surface a transaction after the
+ * watermark has already moved past its timestamp — PayPal's reporting lag is
+ * exactly that, and a backdated or late-settled record does it too. Re-reading a
+ * window on every run is what closes that hole, and it is free: every adapter
+ * upserts on (source, external_id), so re-reading rewrites identical rows.
+ *
+ * The default of 1 hour is enough for ordinary late arrivals. Raising it to 24
+ * makes every sync re-ingest a full day, which is both a stronger correctness
+ * guarantee and what makes a live demo show real `fetched`/`upserted` counts
+ * while the revenue totals stay bit-identical.
+ *
+ * Cost is linear: a bigger overlap means more pages read per sync, nothing else.
+ */
+const DEFAULT_OVERLAP_HOURS = 1;
+
+function overlapMsFromEnv(): number {
+  const raw = Number(process.env.PAYPAL_OVERLAP_HOURS ?? DEFAULT_OVERLAP_HOURS);
+  const hours = Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_OVERLAP_HOURS;
+  return hours * MS_PER_HOUR;
+}
 
 /**
  * How far behind real time PayPal's reporting is, and therefore the newest
@@ -82,6 +105,8 @@ export class PayPalAdapter implements SourceAdapter {
     private readonly client: PayPalClient,
     /** How far back to look on a first sync, with no watermark yet. */
     private readonly lookbackDays: number = Number(process.env.PAYPAL_LOOKBACK_DAYS ?? 31),
+    /** How far back BEFORE the watermark to re-read on every sync. */
+    private readonly overlapMs: number = overlapMsFromEnv(),
   ) {}
 
   static fromEnv(): PayPalAdapter {
@@ -186,7 +211,9 @@ export class PayPalAdapter implements SourceAdapter {
     if (cursor) {
       const parsed = new Date(cursor);
       if (!Number.isNaN(parsed.getTime())) {
-        return new Date(parsed.getTime() - OVERLAP_MS);
+        // The watermark is where we got to; the overlap is how far back we
+        // re-read anyway. Never trust the watermark as an exact resume point.
+        return new Date(parsed.getTime() - this.overlapMs);
       }
       logger.warn({ source: PAYPAL_SOURCE, cursor }, 'unparseable watermark; doing a full lookback');
     }

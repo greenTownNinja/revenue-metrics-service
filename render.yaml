@@ -27,6 +27,12 @@ services:
       # Transaction Search caps a single window at 31 days.
       - key: PAYPAL_LOOKBACK_DAYS
         value: "31"
+      # How far before the watermark each sync re-reads. 24 means every sync
+      # re-ingests a full day: real fetched/upserted counts, unchanged totals.
+      - key: PAYPAL_OVERLAP_HOURS
+        value: "24"
+      - key: STRIPE_OVERLAP_HOURS
+        value: "24"
       # Set these in the Render dashboard; never commit them.
       - key: DATABASE_URL
         sync: false
