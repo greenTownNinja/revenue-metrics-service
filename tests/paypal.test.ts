@@ -8,11 +8,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   PAYPAL_VOCABULARY,
+  PayPalAdapter,
   normalizePayPalTransaction,
 } from '../src/sources/paypal/PayPalAdapter.js';
 import { parseDecimalToMinor, currencyExponent, DecimalParseError } from '../src/sources/decimal.js';
 import { CanonicalStatus, isCollected } from '../src/revenue/canonical.js';
-import type { PayPalTransaction } from '../src/sources/paypal/PayPalClient.js';
+import type { PayPalClient, PayPalTransaction } from '../src/sources/paypal/PayPalClient.js';
 
 function tx(info: Record<string, unknown>): PayPalTransaction {
   return {
@@ -182,5 +183,70 @@ describe('PayPal transaction normalization', () => {
   it('survives a completely empty payload', () => {
     const result = normalizePayPalTransaction({} as PayPalTransaction);
     expect('reason' in result).toBe(true);
+  });
+});
+
+/**
+ * The reporting-lag horizon.
+ *
+ * PayPal's Transaction Search does not show transactions for up to three hours,
+ * and answers 404 rather than an empty page when asked for a window that recent.
+ * Both facts are load-bearing, and the second one caused a live 503.
+ */
+describe('PayPal reporting horizon', () => {
+  const HOUR = 3_600_000;
+
+  /** Records the windows requested, and returns nothing. */
+  function spyClient(): { client: PayPalClient; windows: { start: Date; end: Date }[] } {
+    const windows: { start: Date; end: Date }[] = [];
+    const client = {
+      listTransactions: async (p: { startDate: Date; endDate: Date; page: number }) => {
+        windows.push({ start: p.startDate, end: p.endDate });
+        return { transaction_details: [], page: p.page, total_pages: 1 };
+      },
+    } as unknown as PayPalClient;
+    return { client, windows };
+  }
+
+  it('never requests a window reaching into the last three hours', async () => {
+    const { client, windows } = spyClient();
+    const adapter = new PayPalAdapter(client);
+    const cursor = new Date(Date.now() - 10 * HOUR).toISOString();
+
+    await adapter.fetch({ cursor, maxPages: 10 });
+
+    expect(windows.length).toBeGreaterThan(0);
+    const newest = Math.max(...windows.map((w) => w.end.getTime()));
+    // Allow a second of slack for the clock moving during the call.
+    expect(newest).toBeLessThanOrEqual(Date.now() - 3 * HOUR + 1000);
+  });
+
+  it('does not advance the watermark into the unsettled window', async () => {
+    const { client } = spyClient();
+    const adapter = new PayPalAdapter(client);
+    const cursor = new Date(Date.now() - 10 * HOUR).toISOString();
+
+    const result = await adapter.fetch({ cursor, maxPages: 10 });
+
+    // Advancing to `now` would permanently skip transactions that only become
+    // visible later — they would fall behind the watermark before being fetched.
+    expect(result.nextCursor).not.toBeNull();
+    expect(new Date(result.nextCursor!).getTime()).toBeLessThanOrEqual(
+      Date.now() - 3 * HOUR + 1000,
+    );
+  });
+
+  it('makes no request at all once caught up, and holds the watermark', async () => {
+    const { client, windows } = spyClient();
+    const adapter = new PayPalAdapter(client);
+    // Watermark inside the lag window: everything newer is invisible to PayPal.
+    const cursor = new Date(Date.now() - 30 * 60_000).toISOString();
+
+    const result = await adapter.fetch({ cursor, maxPages: 10 });
+
+    // A request here is what produced the 404 → 503 in production.
+    expect(windows).toHaveLength(0);
+    expect(result.fetched).toBe(0);
+    expect(result.nextCursor).toBe(cursor);
   });
 });

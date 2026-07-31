@@ -150,6 +150,30 @@ export class PayPalClient {
         `Transaction Search rejected the request: ${detail.slice(0, 300)}`,
       );
     }
+    if (res.status === 404) {
+      // MEASURED, 2026-07-31 sandbox: Transaction Search answers 404
+      // INVALID_REQUEST "Data for the given start date is not available." for any
+      // start_date newer than roughly now-2h — its reporting horizon. That is
+      // "nothing has settled that recently", not an outage, and returning 503
+      // turned an ordinary sync into a failed one.
+      //
+      // PayPalAdapter already keeps its windows behind the horizon so this should
+      // not be reached; it survives as a backstop for clock skew between this
+      // process and PayPal, where a window can be a few seconds too fresh. Any
+      // OTHER 404 is still a real error.
+      const detail = await res.text().catch(() => '');
+      if (/data for the given start date is not available/i.test(detail)) {
+        logger.info(
+          { source: PAYPAL_SOURCE, startDate: params.startDate.toISOString() },
+          'start_date is inside PayPal\'s reporting horizon; treating as no data yet',
+        );
+        return { transaction_details: [], page: params.page, total_pages: 0 };
+      }
+      throw new UpstreamUnavailableError(
+        PAYPAL_SOURCE,
+        `Transaction Search returned 404: ${detail.slice(0, 300)}`,
+      );
+    }
     if (!res.ok) {
       throw new UpstreamUnavailableError(PAYPAL_SOURCE, `Transaction Search returned ${res.status}`);
     }

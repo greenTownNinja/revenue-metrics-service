@@ -464,6 +464,17 @@ Free-tier realities this is built around:
 
 **Incremental sync is time-based, not cursor-based.** Both live adapters watermark on a timestamp rather than an object id. Stripe lists newest-first and `starting_after` pages toward *older* records, so an id cursor walks backwards through history and never sees anything new; PayPal's Transaction Search is queried by date range and has no cursor at all. Both deliberately re-fetch an overlap window (1 hour) so a transaction created either side of a run boundary is not lost — re-fetching is free because the upsert is idempotent, and missing a charge is not. Neither advances its watermark past a window it did not finish reading.
 
+**PayPal's watermark stops three hours behind real time.** PayPal documents up to a three-hour delay before an executed transaction appears in Transaction Search, and measurement on 2026-07-31 showed the API does not return an empty page for a window that recent — it answers `404 INVALID_REQUEST "Data for the given start date is not available."` for any `start_date` newer than roughly `now-2h`:
+
+```
+start = now-  0m   404     start = now-120m   200  total=0
+start = now- 60m   404     start = now-180m   200  total=20
+```
+
+So the adapter never queries past `now - 3h`, and — the part that actually matters — never advances its watermark past it either. Advancing to `now` is silent data loss: transactions inside the lag window are invisible when the sync runs, so a watermark beyond them means the next run starts *after* them and they are never fetched. Holding at the horizon re-queries the unsettled window until it settles, which the idempotent upsert makes free. The cost is that a PayPal transaction takes up to three hours to reach the metric; the alternative is losing it.
+
+A sync with nothing settled yet returns `fetched: 0` and `200`, not an error — being caught up is not an outage.
+
 **PayPal reports money as decimal strings**, which is where a float would otherwise enter a service that has none. [src/sources/decimal.ts](src/sources/decimal.ts) converts on the string: `19.99 * 100` is `1998.9999999999998` in IEEE-754, and past 2^53 the digits are simply gone. It also refuses precision the currency cannot represent (`10.005` USD) rather than rounding a half-cent into existence, and handles zero-decimal currencies (JPY, HUF, TWD) where treating `1500` as `15.00` would be a 100× error.
 
 **PayPal negative amounts** (refunds, payouts) are stored as positive amounts with status `REFUNDED`, not as negative revenue. A negative row would violate the CHECK constraint and, worse, would let an outflow quietly *reduce* a collected total instead of being excluded outright.
